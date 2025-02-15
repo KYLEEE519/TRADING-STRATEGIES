@@ -1,0 +1,185 @@
+# ==================== 策略执行类 ====================
+class VolatilityRSIStrategy:
+    def __init__(
+        self,
+        data_df,
+        initial_capital=10000.0,
+        params=None
+    ):
+        """
+        :param data_df: 必须包含 timestamp, open, high, low, close 列
+        :param initial_capital: 初始资金
+        :param params: 策略参数字典。若传入，会与默认参数合并。未指定的参数将依旧使用默认值。
+        """
+        # 默认参数
+        default_params = {
+            "window": 5,              # 价格变化的滚动窗口
+            "atr_period": 14,         # ATR的计算周期
+            "atr_multiplier": 1.0,    # ATR阈值倍数
+            "take_profit": 2.0,       # 止盈倍数(基于ATR)
+            "stop_loss": 1.5,         # 止损倍数(基于ATR)
+            "rsi_window": 14,         # RSI的计算周期
+            "rsi_upper": 70,          # RSI上阈值
+            "rsi_lower": 30,          # RSI下阈值
+            "max_trades": 10,         # 最大允许同时持有的仓位数
+            "max_drawdown": -0.05,    # 最大回撤(例如-0.05代表-5%)
+            "trend_ma_period": 50,    # 趋势过滤MA周期
+            "risk_per_trade": 0.01    # 单笔交易风险占比(1%)
+        }
+
+        # 如果传入了 params，则与默认参数进行合并
+        if params:
+            default_params.update(params)
+
+        self.params = default_params
+        self.df = data_df.copy()
+        self.signals = None
+        self.initial_capital = initial_capital
+
+    def _safe_rolling(self, series, window, func):
+        """安全的滚动窗口计算"""
+        return series.rolling(
+            window=window,
+            min_periods=1
+        ).apply(lambda x: func(x), raw=False)
+
+    def generate_signals(self):
+        """
+        生成交易信号:
+          1) 价格变化是否超过 ATR阈值
+          2) RSI 是否超买/超卖
+          3) 趋势过滤：通过MA判断大方向
+          4) 去除连续同向信号
+        """
+        df = self.df
+        p = self.params
+
+        # ========== 1) 基础数据计算 ==========
+        # (a) 滚动窗口价格变化
+        df["roll_open"] = self._safe_rolling(df["open"], p["window"], lambda x: x.iloc[0])
+        df["roll_close"] = self._safe_rolling(df["close"], p["window"], lambda x: x.iloc[-1])
+        df["price_change"] = df["roll_close"] - df["roll_open"]
+
+        # (b) ATR
+        atr = ta.volatility.AverageTrueRange(
+            high=df["high"], low=df["low"], close=df["close"], window=p["atr_period"]
+        )
+        df["ATR"] = atr.average_true_range()
+        df["vol_threshold"] = df["ATR"] * p["atr_multiplier"]
+
+        # (c) RSI
+        rsi = ta.momentum.RSIIndicator(df["close"], window=p["rsi_window"])
+        df["rsi"] = rsi.rsi()
+
+        # (d) 趋势过滤: 用MA判断是否在多头(价格>MA)或空头(价格<MA)
+        df["MA"] = df["close"].rolling(window=p["trend_ma_period"], min_periods=1).mean()
+        df["up_trend"] = df["close"] > df["MA"]
+        df["down_trend"] = df["close"] < df["MA"]
+
+        # ========== 2) 原始信号 (包含趋势过滤) ==========
+        df["raw_sell"] = (
+            (df["price_change"] < -df["vol_threshold"]) &
+            (df["rsi"] > p["rsi_upper"]) &
+            (df["down_trend"] == True)  # 仅在空头趋势下做空
+        )
+        df["raw_buy"] = (
+            (df["price_change"] > df["vol_threshold"]) &
+            (df["rsi"] < p["rsi_lower"]) &
+            (df["up_trend"] == True)    # 仅在多头趋势下做多
+        )
+
+        # ========== 3) 信号去重：避免连续同方向信号 ==========
+        df["sell"] = df["raw_sell"] & ~df["raw_sell"].shift(1).fillna(False)
+        df["buy"]  = df["raw_buy"] & ~df["raw_buy"].shift(1).fillna(False)
+
+        self.signals = df[[
+            "timestamp", "open", "high", "low", "close",
+            "price_change", "ATR", "rsi",
+            "raw_sell", "raw_buy", "sell", "buy"
+        ]].copy()
+
+        print("\n🔔 信号统计:")
+        print(f"做空信号: {self.signals['sell'].sum()}")
+        print(f"做多信号: {self.signals['buy'].sum()}")
+
+    def run_backtest(self):
+        """
+        回测逻辑:
+          1) 使用资金曲线, 维护 equity
+          2) 计算持仓数量(position_size) = (风险资金) / (止损空间)
+          3) 动态更新回撤, 若回撤超过阈值, 停止交易
+          4) 平仓时更新实际盈亏 -> equity
+        """
+        if self.signals is None:
+            print("❌ 请先调用 generate_signals()")
+            return None
+
+        # --- 初始化资金相关变量 ---
+        equity = self.initial_capital
+        peak_equity = equity
+        max_drawdown_allowed = self.params["max_drawdown"]
+        risk_per_trade = self.params["risk_per_trade"]  # 单笔风险占比(如0.01)
+
+        trades = []
+
+        # 这里 signals 已包含必要字段(high, low, close等)
+        merged_df = self.signals
+
+        for idx, row in merged_df.iterrows():
+
+            # 1) 检查回撤
+            current_drawdown = (equity - peak_equity) / peak_equity
+            if current_drawdown < max_drawdown_allowed:
+                print(f"⚠️ 触发最大回撤 {current_drawdown:.2%}, 停止交易")
+                break
+
+            # 2) 刷新峰值
+            if equity > peak_equity:
+                peak_equity = equity
+
+            # 3) 开仓逻辑
+            if len([t for t in trades if t["exit_time"] is None]) < self.params["max_trades"]:
+
+                if row["sell"]:
+                    entry_price = row["close"]
+                    stop_loss_price = entry_price + (row["ATR"] * self.params["stop_loss"])
+                    take_profit_price = entry_price - (row["ATR"] * self.params["take_profit"])
+
+                    risk_amount = equity * risk_per_trade
+                    stop_range = abs(entry_price - stop_loss_price)
+                    position_size = risk_amount / stop_range if stop_range else 0
+
+                    new_trade = {
+                        "type": "short",
+                        "entry_time": row["timestamp"],
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss_price,
+                        "take_profit": take_profit_price,
+                        "size": position_size,
+                        "exit_time": None,
+                        "exit_price": None,
+                        "profit": None
+                    }
+                    trades.append(new_trade)
+
+                elif row["buy"]:
+                    entry_price = row["close"]
+                    stop_loss_price = entry_price - (row["ATR"] * self.params["stop_loss"])
+                    take_profit_price = entry_price + (row["ATR"] * self.params["take_profit"])
+
+                    risk_amount = equity * risk_per_trade
+                    stop_range = abs(entry_price - stop_loss_price)
+                    position_size = risk_amount / stop_range if stop_range else 0
+
+                    new_trade = {
+                        "type": "long",
+                        "entry_time": row["timestamp"],
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss_price,
+                        "take_profit": take_profit_price,
+                        "size": position_size,
+                        "exit_time": None,
+                        "exit_price": None,
+                        "profit": None
+                    }
+                    trades.append(new_trade)
