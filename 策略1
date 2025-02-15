@@ -1,0 +1,335 @@
+import pandas as pd
+import time
+from okx import MarketData
+
+# ==================== 数据获取类 ====================
+class OKXDataFetcher:
+    def __init__(self, instId="BTC-USDT"):
+        self.instId = instId
+        self.df = None
+        self._initialize_api()
+
+    def _initialize_api(self):
+        """即使公共API也需要基础配置"""
+        self.market = MarketData.MarketAPI(
+            api_key="",
+            api_secret_key="",
+            passphrase="",
+            flag="0"  # 0: 实盘 1: 模拟盘
+        )
+
+    def fetch_1m_data(self, days=1):
+        """
+        从当前时刻往前推 days 天(1天=1440条 1m K线)，
+        使用 'after' 参数分页获取更早数据。OKX 公共接口一般
+        只能提供较近的 1~2 天 1m 数据，超过可能拿不到。
+        """
+        total_limit = 1440 * days
+        all_data = []
+        after = None
+        retry = 0
+        max_retries = 3
+
+        print(f"▶️ 开始获取 {self.instId} {days}天数据...")
+
+        while len(all_data) < total_limit and retry < max_retries:
+            try:
+                params = {
+                    "instId": self.instId,
+                    "bar": "1m",
+                    # 每次请求最多300条
+                    "limit": min(300, total_limit - len(all_data))
+                }
+                if after is not None:
+                    params["after"] = str(after)
+
+                resp = self.market.get_candlesticks(**params)
+
+                if resp.get("code") != "0":
+                    print(f"⚠️ API错误: {resp.get('msg')}")
+                    retry += 1
+                    time.sleep(1)
+                    continue
+
+                batch = resp.get("data", [])
+                if not batch:
+                    print("✅ 已获取全部可用数据")
+                    break
+
+                all_data.extend(batch)
+                oldest = batch[-1]
+                oldest_ts = int(oldest[0])
+                after = oldest_ts - 1
+
+                print(
+                    f"▏已获取 {len(batch):>3} 条，"
+                    f"累计 {len(all_data):>4}/{total_limit}",
+                    end="\r"
+                )
+                time.sleep(0.15)
+                retry = 0
+
+            except Exception as e:
+                print(f"🔴 请求异常: {str(e)}")
+                retry += 1
+                time.sleep(2 ** retry)
+
+        # 整理成 DataFrame
+        if all_data:
+            columns = [
+                "timestamp", "open", "high", "low", "close",
+                "vol", "volCcy", "volCcyQuote", "confirm"
+            ]
+
+            full_df = pd.DataFrame(all_data, columns=columns)
+            self.df = full_df[["timestamp", "open", "high", "low", "close", "vol"]].copy()
+
+            numeric_cols = ["open", "high", "low", "close", "vol"]
+            self.df[numeric_cols] = self.df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+
+            self.df["timestamp"] = pd.to_datetime(
+                pd.to_numeric(self.df["timestamp"]),
+                unit="ms",
+                utc=True
+            ).dt.tz_convert(None)
+
+            self.df = self.df.drop_duplicates(subset=["timestamp"])
+            self.df = self.df.sort_values("timestamp").reset_index(drop=True)
+
+            print(f"\n✅ 最终获取 {len(self.df)} 条有效数据")
+            if not self.df.empty:
+                print(f"⏰ 时间范围: {self.df.timestamp.iloc[0]} 至 {self.df.timestamp.iloc[-1]}")
+        else:
+            print("❌ 未获取到任何有效数据")
+
+    def get_cleaned_data(self):
+        """获取处理后的干净数据"""
+        return self.df.copy() if self.df is not None else None
+
+
+# ==================== 策略执行类 ====================
+class VolatilityMeanStrategy:
+    def __init__(
+        self,
+        data_df,
+        initial_capital=10000.0,
+        params=None
+    ):
+        # 默认参数
+        default_params = {
+            "volatility_window": 5,       # 波动率计算窗口
+            "volatility_threshold": 0.005,# 波动率阈值(如0.5%)
+            "ma_window": 5,              # 均线计算窗口
+            "take_profit_long": 0.003,   # 多头止盈(0.3%)
+            "stop_loss_long": 0.005,     # 多头止损(0.5%)
+            "take_profit_short": 0.003,  # 空头止盈(0.3%)
+            "stop_loss_short": 0.005,    # 空头止损(0.5%)
+            "max_trades": 10,            # 最大持仓数量
+            "max_drawdown": -0.05,       # 最大回撤(-5%)
+            "risk_per_trade": 0.01       # 单笔风险比例(1%)
+        }
+
+        if params:
+            default_params.update(params)
+        self.params = default_params
+        self.df = data_df.copy()
+        self.signals = None
+        self.initial_capital = initial_capital
+
+    def generate_signals(self):
+        """生成交易信号"""
+        df = self.df
+        p = self.params
+
+        # 计算波动率
+        df['window_high'] = df['high'].rolling(window=p['volatility_window']).max()
+        df['window_low'] = df['low'].rolling(window=p['volatility_window']).min()
+        df['window_open'] = df['open'].shift(p['volatility_window'] - 1)
+
+        df['volatility'] = (df['window_high'] - df['window_low']) / df['window_open']
+
+        # 计算移动平均
+        df['ma'] = df['close'].rolling(window=p['ma_window']).mean()
+
+        # 生成初步信号
+        df['raw_buy'] = (
+            (df['volatility'] >= p['volatility_threshold']) &
+            (df['close'] < df['ma'])
+        )
+        df['raw_sell'] = (
+            (df['volatility'] >= p['volatility_threshold']) &
+            (df['close'] > df['ma'])
+        )
+
+        # 去除连续信号
+        df['buy'] = df['raw_buy'] & ~df['raw_buy'].shift(1).fillna(False)
+        df['sell'] = df['raw_sell'] & ~df['raw_sell'].shift(1).fillna(False)
+
+        self.signals = df[[
+            'timestamp', 'open', 'high', 'low', 'close',
+            'volatility', 'ma', 'buy', 'sell'
+        ]].copy()
+
+    def run_backtest(self):
+        """执行回测并打印统计信息"""
+        if self.signals is None:
+            print("❌ 请先调用 generate_signals()")
+            return None
+
+        import pandas as pd
+
+        equity = self.initial_capital
+        peak_equity = equity
+        trades = []
+        p = self.params
+
+        for idx, row in self.signals.iterrows():
+            # 1) 检查回撤
+            current_drawdown = (equity - peak_equity) / peak_equity
+            if current_drawdown < p['max_drawdown']:
+                print(f"⚠️ 触发最大回撤 {current_drawdown:.2%}，停止交易")
+                break
+
+            # 2) 刷新峰值
+            if equity > peak_equity:
+                peak_equity = equity
+
+            # 3) 开仓逻辑
+            open_trades = [t for t in trades if t['exit_time'] is None]
+            if len(open_trades) < p['max_trades']:
+                if row['buy']:
+                    entry_price = row['close']
+                    tp_price = entry_price * (1 + p['take_profit_long'])
+                    sl_price = entry_price * (1 - p['stop_loss_long'])
+
+                    risk_amount = equity * p['risk_per_trade']
+                    price_range = entry_price - sl_price
+                    position_size = risk_amount / price_range if price_range != 0 else 0
+
+                    trades.append({
+                        'type': 'long',
+                        'entry_time': row['timestamp'],
+                        'entry_price': entry_price,
+                        'take_profit': tp_price,
+                        'stop_loss': sl_price,
+                        'size': position_size,
+                        'exit_time': None,
+                        'exit_price': None,
+                        'profit': None
+                    })
+
+                elif row['sell']:
+                    entry_price = row['close']
+                    tp_price = entry_price * (1 - p['take_profit_short'])
+                    sl_price = entry_price * (1 + p['stop_loss_short'])
+
+                    risk_amount = equity * p['risk_per_trade']
+                    price_range = sl_price - entry_price
+                    position_size = risk_amount / price_range if price_range != 0 else 0
+
+                    trades.append({
+                        'type': 'short',
+                        'entry_time': row['timestamp'],
+                        'entry_price': entry_price,
+                        'take_profit': tp_price,
+                        'stop_loss': sl_price,
+                        'size': position_size,
+                        'exit_time': None,
+                        'exit_price': None,
+                        'profit': None
+                    })
+
+            # 4) 平仓逻辑
+            for trade in trades:
+                if trade['exit_time'] is None:
+                    current_high = row['high']
+                    current_low = row['low']
+
+                    if trade['type'] == 'long':
+                        if current_high >= trade['take_profit']:
+                            exit_price = trade['take_profit']
+                        elif current_low <= trade['stop_loss']:
+                            exit_price = trade['stop_loss']
+                        else:
+                            continue
+
+                        profit = (exit_price - trade['entry_price']) * trade['size']
+                        equity += profit
+
+                    elif trade['type'] == 'short':
+                        if current_low <= trade['take_profit']:
+                            exit_price = trade['take_profit']
+                        elif current_high >= trade['stop_loss']:
+                            exit_price = trade['stop_loss']
+                        else:
+                            continue
+
+                        profit = (trade['entry_price'] - exit_price) * trade['size']
+                        equity += profit
+
+                    trade.update({
+                        'exit_time': row['timestamp'],
+                        'exit_price': exit_price,
+                        'profit': profit
+                    })
+
+        # ========== 回测报告: 交易明细与统计 ==========
+        report = pd.DataFrame(trades)
+        if not report.empty:
+            closed_trades = report.dropna(subset=["exit_time"])  # 已平仓的交易
+            total_closed = len(closed_trades)
+            if total_closed > 0:
+                # 统计信息
+                total_profit = closed_trades["profit"].sum()  # 所有交易总盈利
+                win_trades = len(closed_trades[closed_trades["profit"] > 0])
+                win_rate = win_trades / total_closed
+                avg_profit = closed_trades["profit"].mean()
+
+                final_equity = equity
+                total_return_pct = (final_equity - self.initial_capital) / self.initial_capital
+
+                print(f"\n📊 回测结果: {total_closed} 笔平仓交易")
+                print(f"总盈利: {total_profit:.2f}")
+                print(f"胜率: {win_rate:.2%}")
+                print(f"平均单笔盈亏: {avg_profit:.4f}")
+                print(f"最终资金: {final_equity:.2f}")
+                print(f"总收益率: {total_return_pct:.2%}")
+            else:
+                print("\n⚠️ 无平仓交易，无法统计胜率和收益率。")
+        else:
+            print("\n⚠️ 无任何交易记录。")
+
+        return report
+
+
+# ==================== 使用示例 ====================
+if __name__ == "__main__":
+    # 1) 获取数据
+    fetcher = OKXDataFetcher(instId="TRUMP-USDT")
+    fetcher.fetch_1m_data(days=1)  # 例如拉取过去1天的1分钟数据
+
+    # 2) 整理数据
+    clean_data = fetcher.get_cleaned_data()
+
+    # 3) 初始化并执行策略
+    if clean_data is not None and not clean_data.empty:
+        strategy = VolatilityMeanStrategy(
+            data_df=clean_data,
+            initial_capital=10000,
+            params={
+                "volatility_threshold": 0.005,
+                "take_profit_long": 0.003,
+                "stop_loss_long": 0.005,
+                "take_profit_short": 0.003,
+                "stop_loss_short": 0.005,
+                "risk_per_trade": 0.02
+            }
+        )
+        strategy.generate_signals()
+        results = strategy.run_backtest()
+
+        if results is not None and not results.empty:
+            print("\n===== 交易明细 =====")
+            print(results[["entry_time", "type", "entry_price", "exit_price", "profit"]])
+    else:
+        print("❌ 未获取到有效K线数据，无法运行策略。")
