@@ -1,0 +1,21 @@
+from okx import Account
+
+# 初始化账户 API
+account = Account.AccountAPI(
+    api_key='',
+    api_secret_key='',
+    passphrase='',
+    flag='1'  # 0表示实盘，1表示模拟盘
+)
+
+# 获取合约持仓信息
+print("\n🚀 测试合约持仓 API ...")
+try:
+    resp_positions = account.get_positions()
+    if resp_positions.get("code") == "0":
+        print("✅ 合约持仓获取成功")
+        print(resp_positions.get("data"))
+    else:
+        print(f"⚠️ 合约持仓获取失败: {resp_positions.get('msg')}")
+except Exception as e:
+    print(f"❌ 读取合约持仓时报错: {e}")
